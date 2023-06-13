@@ -118,6 +118,20 @@ def uniq(it):
     return (seen.add(obj) or obj for obj in it if obj not in seen)
 
 
+def _get_fd_max_open():
+    """Returns the maximum open file descriptor by checking /proc/self/fd (when
+    available) or returns -1 if there is no /proc/self/fd directory.
+    """
+    try:
+        fd_max_open = 0
+        for entry in os.scandir("/proc/self/fd"):
+            fd = int(entry.name)
+            if fd > fd_max_open:
+                fd_max_open = fd
+        return fd_max_open
+    except FileNotFoundError:
+        return -1
+
 try:
     closerange = os.closerange
 except AttributeError:
@@ -129,29 +143,29 @@ except AttributeError:
             except OSError as exc:
                 if exc.errno != errno.EBADF:
                     raise
-
+else:
     def close_open_fds(keep=None):
         # must make sure this is 0-inclusive (Issue #celery/1882)
         keep = list(uniq(sorted(
             f for f in map(maybe_fileno, keep or []) if f is not None
         )))
         maxfd = get_fdmax(default=2048)
+        # If the system configured maximum file descriptor is small,
+        # just close all possible descriptors with closerange. 
+        # On some systems the maximum file descriptor is 1073741816 
+        # - https://github.com/containerd/containerd/pull/7566. In those
+        # cases, find first (if possible) the largest file descriptor using
+        # /proc/self, as in most forseable cases there will less files 
+        # open than 1 billion. If not possible, keep existing behavior,
+        # which can result in this function taking more than one hour.
+        if maxfd>1_000_000:
+            max_fd_open = _get_fd_max_open()
+            if max_fd_open != -1:
+                maxfd = max_fd_open
         kL, kH = iter([-1] + keep), iter(keep + [maxfd])
         for low, high in zip_longest(kL, kH):
             if low + 1 != high:
                 closerange(low + 1, high)
-else:
-    def close_open_fds(keep=None):  # noqa
-        keep = [maybe_fileno(f)
-                for f in (keep or []) if maybe_fileno(f) is not None]
-        for fd in reversed(range(get_fdmax(default=2048))):
-            if fd not in keep:
-                try:
-                    os.close(fd)
-                except OSError as exc:
-                    if exc.errno != errno.EBADF:
-                        raise
-
 
 def get_errno(exc):
     """:exc:`socket.error` and :exc:`IOError` first got
